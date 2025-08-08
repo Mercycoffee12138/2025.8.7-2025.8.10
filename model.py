@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.init as init
 import torch.nn.functional as F
+import torchvision.models as models
 
 class MultiHeadChannelAttention(nn.Module):
     """多头通道注意力机制"""
@@ -39,68 +40,105 @@ class MultiHeadChannelAttention(nn.Module):
         V = V.view(b, self.num_heads, self.head_dim)
         
         # 计算注意力分数
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [batch, num_heads, head_dim]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [batch, num_heads, head_dim, head_dim]
         
         # 对每个头独立计算注意力权重
-        attn_weights = F.softmax(scores, dim=-1)  # [batch, num_heads, head_dim]
+        attn_weights = F.softmax(scores, dim=-1)  # [batch, num_heads, head_dim, head_dim]
         attn_weights = self.dropout(attn_weights)
         
         # 应用注意力权重
-        attended = attn_weights * V  # [batch, num_heads, head_dim]
+        attended = torch.matmul(attn_weights, V)  # [batch, num_heads, head_dim]
         
         # 重新组合多头输出
-        attended = attended.view(b, c)  # [batch, channel]
+        attended = attended.transpose(1, 2).contiguous().view(b, c)  # [batch, channel]
         
         # 输出投影
         output = self.out_proj(attended)  # [batch, channel]
+        output = output.view(b, c, 1, 1)  # 恢复形状 [batch, channel, 1, 1]
         
         return output
+    
 
-class AudioClassifier(nn.Module):
-    """音频分类器 - 用于AI音乐检测"""
-    def __init__(self):
-        super(AudioClassifier, self).__init__()
+class ResNeXtBottleneck(nn.Module):
+    '''ResNeXt Bottleneck Block - 用于音频分类器的基础模块'''
+    def __init__(self, in_channels, out_channels, stride=1, cardinality=8, base_width=4):
+        super(ResNeXtBottleneck, self).__init__()
+        width_ratio = out_channels / (64.0)  # 和 ResNeXt 一致的宽度比例公式
+        D = int(base_width * width_ratio) * cardinality
         
-        conv_layers = []
-
-        self.conv1 = nn.Conv2d(1, 8, kernel_size=(5, 5), stride=(2, 2), padding=(2, 2))
-        self.relu1 = nn.ReLU()
-        self.bn1 = nn.BatchNorm2d(8)
-        init.kaiming_normal_(self.conv1.weight, a=0.1)
-        self.conv1.bias.data.zero_()
-        conv_layers += [self.conv1, self.relu1, self.bn1]
-
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-        self.relu2 = nn.ReLU()
-        self.bn2 = nn.BatchNorm2d(16)
-        init.kaiming_normal_(self.conv2.weight, a=0.1)
-        self.conv2.bias.data.zero_()
-        conv_layers += [self.conv2, self.relu2, self.bn2]
-
-        self.conv3 = nn.Conv2d(16, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-        self.relu3 = nn.ReLU()
-        self.bn3 = nn.BatchNorm2d(32)
-        init.kaiming_normal_(self.conv3.weight, a=0.1)
-        self.conv3.bias.data.zero_()
-        conv_layers += [self.conv3, self.relu3, self.bn3]
-
-        self.conv4 = nn.Conv2d(32, 64, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-        self.relu4 = nn.ReLU()
-        self.bn4 = nn.BatchNorm2d(64)
-        init.kaiming_normal_(self.conv4.weight, a=0.1)
-        self.conv4.bias.data.zero_()
-        conv_layers += [self.conv4, self.relu4, self.bn4]
-
-        self.conv = nn.Sequential(*conv_layers)
-
-        self.ap = nn.AdaptiveAvgPool2d(output_size=1)
-        # 使用多头注意力机制，64个通道，8个头
-        self.attn = MultiHeadChannelAttention(in_channels=64, num_heads=8)
-        self.lin = nn.Linear(in_features=64, out_features=2)
+        self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, bias=False)
+        self.bn_reduce = nn.BatchNorm2d(D)
+        
+        self.conv_group = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, 
+                                    groups=cardinality, bias=False)
+        self.bn_group = nn.BatchNorm2d(D)
+        
+        self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, bias=False)
+        self.bn_expand = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.ap(x)  # [batch, 64, 1, 1]
-        x = self.attn(x)  # [batch, 64]
-        x = self.lin(x)
+        out = torch.relu(self.bn_reduce(self.conv_reduce(x)))
+        out = torch.relu(self.bn_group(self.conv_group(out)))
+        out = self.bn_expand(self.conv_expand(out))
+        out += self.shortcut(x)
+        return torch.relu(out)
+
+class AudioClassifier(nn.Module):
+    def __init__(self, num_classes=2):
+        super(AudioClassifier, self).__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        # Stage 1
+        self.layer1 = self._make_layer(16, 32, num_blocks=1, stride=1)
+        # Stage 2
+        self.layer2 = self._make_layer(32, 64, num_blocks=1, stride=2)
+        # Stage 3
+        self.layer3 = self._make_layer(64, 128, num_blocks=1, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+
+        # 多头通道注意力
+        self.channel_attn = MultiHeadChannelAttention(in_channels=128, num_heads=8)
+        self.dropout = nn.Dropout(0.3)
+
+        self.fc = nn.Linear(128, num_classes)
+
+    def _make_layer(self, in_channels, out_channels, num_blocks, stride):
+        layers = []
+        layers.append(ResNeXtBottleneck(in_channels, out_channels, stride))
+        for _ in range(1, num_blocks):
+            layers.append(ResNeXtBottleneck(out_channels, out_channels))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        # 全局池化
+        x = self.avgpool(x)  # [B, 256, 1, 1]
+
+        # 多头通道注意力
+        attn_out = self.channel_attn(x)  # [B, 256, 1, 1]
+
+        # 残差连接
+        x = x + attn_out  # [B, 256, 1, 1]
+
+        # 展平并分类
+        x = x.view(x.size(0), -1)  # [B, 256]
+        x = self.fc(x)
         return x
+

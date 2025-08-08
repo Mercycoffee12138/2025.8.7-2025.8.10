@@ -24,12 +24,12 @@ def save_model(save_name):
     torch.save(model.state_dict(), os.path.join(save_path, save_name))
 
 # 训练超参数
-epochs = 20
+epochs = 60
 batch_size = 16
-lr = 0.001
+lr = 1e-4
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 random_seed = 20240121
-save_path = 'D:\Desktop\competition\code\audio_model'
+save_path = 'D:/Desktop/competition/code/audio_model'
 setup_seed(random_seed)
 
 # 定义模型
@@ -66,6 +66,7 @@ for epoch_num in range(epochs):
         output = model(spectrograms)
         
         batch_loss = criterion(output, labels)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         batch_loss.backward()
         optimizer.step()
         optimizer.zero_grad()
